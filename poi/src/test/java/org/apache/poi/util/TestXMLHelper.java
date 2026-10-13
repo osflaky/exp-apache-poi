@@ -1,0 +1,216 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.util;
+
+import static org.apache.poi.POITestCase.assertContains;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.stream.XMLInputFactory;
+import javax.xml.stream.XMLOutputFactory;
+
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXNotRecognizedException;
+import org.xml.sax.XMLReader;
+
+class TestXMLHelper {
+    @Test
+    void testDocumentBuilder() throws Exception {
+        DocumentBuilder documentBuilder = XMLHelper.newDocumentBuilder();
+        assertNotSame(documentBuilder, XMLHelper.newDocumentBuilder());
+        assertTrue(documentBuilder.isNamespaceAware());
+        assertFalse(documentBuilder.isValidating());
+        documentBuilder.parse(new InputSource(new ByteArrayInputStream("<xml></xml>".getBytes(StandardCharsets.UTF_8))));
+    }
+
+    @Test
+    void testCreatingManyDocumentBuilders() throws Exception {
+        int limit = 1000;
+        ArrayList<CompletableFuture<DocumentBuilder>> futures = new ArrayList<>();
+        for (int i = 0; i < limit; i++) {
+            futures.add(CompletableFuture.supplyAsync(XMLHelper::newDocumentBuilder));
+        }
+        HashSet<DocumentBuilder> dbs = new HashSet<>();
+        for (CompletableFuture<DocumentBuilder> future : futures) {
+            DocumentBuilder documentBuilder = future.get(10, TimeUnit.SECONDS);
+            assertTrue(documentBuilder.isNamespaceAware());
+            dbs.add(documentBuilder);
+        }
+        assertEquals(limit, dbs.size());
+    }
+
+    @Test
+    void testDocumentBuilderFactory() throws Exception {
+        try {
+            DocumentBuilderFactory dbf = XMLHelper.getDocumentBuilderFactory();
+            assertTrue(dbf.getFeature(XMLConstants.FEATURE_SECURE_PROCESSING));
+            assertTrue(dbf.getFeature(XMLHelper.FEATURE_DISALLOW_DOCTYPE_DECL));
+            assertFalse(dbf.getFeature(XMLHelper.FEATURE_LOAD_DTD_GRAMMAR));
+            assertFalse(dbf.getFeature(XMLHelper.FEATURE_LOAD_EXTERNAL_DTD));
+        } catch (AbstractMethodError e) {
+            // ignore exceptions from old parsers that don't support this API (https://bz.apache.org/bugzilla/show_bug.cgi?id=62692)
+        }
+    }
+
+    @Test
+    void testXMLReader() throws Exception {
+        XMLReader reader = XMLHelper.newXMLReader();
+        assertNotSame(reader, XMLHelper.newXMLReader());
+        try {
+            assertTrue(reader.getFeature(XMLConstants.FEATURE_SECURE_PROCESSING));
+            assertFalse(reader.getFeature(XMLHelper.FEATURE_LOAD_DTD_GRAMMAR));
+            assertFalse(reader.getFeature(XMLHelper.FEATURE_LOAD_EXTERNAL_DTD));
+            // assertEquals(XMLHelper.IGNORING_ENTITY_RESOLVER, reader.getEntityResolver());
+            assertNotNull(reader.getProperty(XMLHelper.PROPERTY_ENTITY_EXPANSION_LIMIT));
+            assertEquals("1", reader.getProperty(XMLHelper.PROPERTY_ENTITY_EXPANSION_LIMIT));
+            assertNotNull(reader.getProperty(XMLHelper.PROPERTY_SECURITY_MANAGER));
+        } catch (SAXNotRecognizedException e) {
+            // ignore exceptions from old parsers that don't support these features
+            // (https://bz.apache.org/bugzilla/show_bug.cgi?id=62692)
+        }
+        reader.parse(new InputSource(new ByteArrayInputStream("<xml></xml>".getBytes(StandardCharsets.UTF_8))));
+    }
+
+    @Test
+    void testCreatingManyXMLReaders() throws Exception {
+        int limit = 1000;
+        ArrayList<CompletableFuture<XMLReader>> futures = new ArrayList<>();
+        for (int i = 0; i < limit; i++) {
+            futures.add(CompletableFuture.supplyAsync(() -> {
+                try {
+                    return XMLHelper.newXMLReader();
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        HashSet<XMLReader> readers = new HashSet<>();
+        for (CompletableFuture<XMLReader> future : futures) {
+            XMLReader reader = future.get(10, TimeUnit.SECONDS);
+            try {
+                assertTrue(reader.getFeature(XMLConstants.FEATURE_SECURE_PROCESSING));
+            } catch (SAXNotRecognizedException e) {
+                // can happen for older XML Parsers, e.g. we have a CI Job which runs with Xerces XML Parser
+                assertContains(reader.getClass().getName(), "org.apache.xerces");
+            }
+            readers.add(reader);
+        }
+        assertEquals(limit, readers.size());
+    }
+
+    /**
+     * test that newXMLInputFactory returns a factory with sensible defaults
+     */
+    @Test
+    void testNewXMLInputFactory() {
+        XMLInputFactory factory = XMLHelper.newXMLInputFactory();
+        Assumptions.assumeFalse(System.getProperty("java.version").startsWith("22"),
+            "test ignored for Java 22");
+        assertEquals(Boolean.TRUE, factory.getProperty(XMLInputFactory.IS_NAMESPACE_AWARE));
+        assertEquals(Boolean.FALSE, factory.getProperty(XMLInputFactory.IS_VALIDATING));
+        assertEquals(Boolean.FALSE, factory.getProperty(XMLInputFactory.SUPPORT_DTD));
+        assertEquals(Boolean.FALSE, factory.getProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES));
+    }
+
+    /**
+     * test that newXMLOutputFactory returns a factory with sensible defaults
+     */
+    @Test
+    void testNewXMLOutputFactory() {
+        XMLOutputFactory factory = XMLHelper.newXMLOutputFactory();
+        Assumptions.assumeFalse(System.getProperty("java.version").startsWith("22"),
+            "test ignored for Java 22");
+        assertEquals(Boolean.TRUE, factory.getProperty(XMLOutputFactory.IS_REPAIRING_NAMESPACES));
+    }
+
+    /**
+     * test that newXMLEventFactory returns a factory
+     */
+    @Test
+    void testNewXMLEventFactory() {
+        assertNotNull(XMLHelper.newXMLEventFactory());
+    }
+
+    /**
+     * test that newTransformer returns a transformer
+     */
+    @Test
+    void testNewTransformer() throws Exception {
+        assertNotNull(XMLHelper.newTransformer());
+    }
+
+    @Test
+    void testEscapeXmlNull() {
+        assertNull(XMLHelper.escapeXml(null));
+    }
+
+    @Test
+    void testEscapeXmlNoSpecialCharsReturnsSameInstance() {
+        // fast path: nothing to escape, so the original string is returned unchanged
+        String s = "no special chars here 123";
+        assertSame(s, XMLHelper.escapeXml(s));
+        String empty = "";
+        assertSame(empty, XMLHelper.escapeXml(empty));
+    }
+
+    @Test
+    void testEscapeXmlEachPredefinedEntity() {
+        assertEquals("&amp;", XMLHelper.escapeXml("&"));
+        assertEquals("&lt;", XMLHelper.escapeXml("<"));
+        assertEquals("&gt;", XMLHelper.escapeXml(">"));
+        assertEquals("&quot;", XMLHelper.escapeXml("\""));
+        assertEquals("&apos;", XMLHelper.escapeXml("'"));
+    }
+
+    @Test
+    void testEscapeXmlAmpersandNotDoubleEscaped() {
+        // '&' must be escaped exactly once, even when adjacent to another special char
+        assertEquals("a&amp;&lt;b", XMLHelper.escapeXml("a&<b"));
+        assertEquals("&amp;amp;", XMLHelper.escapeXml("&amp;"));
+    }
+
+    @Test
+    void testEscapeXmlMixedContentPreservesNormalChars() {
+        assertEquals("x &lt;y&gt; &amp; &quot;z&quot; 1", XMLHelper.escapeXml("x <y> & \"z\" 1"));
+    }
+
+    @Test
+    void testEscapeXmlAttributeInjectionIsNeutralised() {
+        // a value that would otherwise break out of an r:id="..." attribute
+        assertEquals("rId1&quot;/&gt;&lt;evil&gt;", XMLHelper.escapeXml("rId1\"/><evil>"));
+    }
+}

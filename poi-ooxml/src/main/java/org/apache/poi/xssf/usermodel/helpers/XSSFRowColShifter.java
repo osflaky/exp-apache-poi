@@ -1,0 +1,313 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.xssf.usermodel.helpers;
+
+import org.apache.logging.log4j.Logger;
+import org.apache.poi.logging.PoiLogManager;
+import org.apache.poi.ss.SpreadsheetVersion;
+import org.apache.poi.ss.formula.FormulaShifter;
+import org.apache.poi.ss.formula.FormulaParser;
+import org.apache.poi.ss.formula.FormulaType;
+import org.apache.poi.ss.formula.FormulaRenderer;
+import org.apache.poi.ss.formula.FormulaParseException;
+import org.apache.poi.ss.formula.ptg.Ptg;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.helpers.BaseRowColShifter;
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.util.Internal;
+import org.apache.poi.xssf.usermodel.*;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTDrawing;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTMarker;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTOneCellAnchor;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTTwoCellAnchor;
+import org.openxmlformats.schemas.spreadsheetml.x2006.main.*;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.apache.logging.log4j.util.Unbox.box;
+
+/**
+ * Class for code common to {@link XSSFRowShifter} and {@link XSSFColumnShifter}
+ *
+ * @since 4.0.0
+ */
+@Internal
+/*private*/ final class XSSFRowColShifter {
+    private static final Logger LOG = PoiLogManager.getLogger(XSSFRowColShifter.class);
+
+    private XSSFRowColShifter() { /*no instances for static classes*/}
+
+    /**
+     * Updated named ranges
+     */
+    /*package*/
+    static void updateNamedRanges(XSSFSheet sheet, FormulaShifter formulaShifter) {
+        XSSFWorkbook wb = sheet.getWorkbook();
+        XSSFEvaluationWorkbook fpb = XSSFEvaluationWorkbook.create(wb);
+        for (Name name : wb.getAllNames()) {
+            String formula = name.getRefersToFormula();
+            int sheetIndex = name.getSheetIndex();
+            final int rowIndex = -1; //don't care, named ranges are not allowed to include structured references
+
+            Ptg[] ptgs = FormulaParser.parse(formula, fpb, FormulaType.NAMEDRANGE, sheetIndex, rowIndex);
+            if (formulaShifter.adjustFormula(ptgs, sheetIndex)) {
+                String shiftedFmla = FormulaRenderer.toFormulaString(fpb, ptgs);
+                name.setRefersToFormula(shiftedFmla);
+            }
+        }
+    }
+
+    /**
+     * Update formulas.
+     */
+    /*package*/ static void updateFormulas(XSSFSheet sheet, FormulaShifter formulaShifter) {
+        //update formulas on the parent sheet
+        updateSheetFormulas(sheet, formulaShifter);
+
+        //update formulas on other sheets
+        XSSFWorkbook wb = sheet.getWorkbook();
+        for(Sheet sh : wb)
+        {
+            if (sheet == sh) continue;
+            updateSheetFormulas((XSSFSheet) sh, formulaShifter);
+        }
+    }
+
+    /*package*/ static void updateSheetFormulas(XSSFSheet sh, FormulaShifter formulashifter) {
+        for (Row r : sh) {
+            XSSFRow row = (XSSFRow) r;
+            updateRowFormulas(row, formulashifter);
+        }
+    }
+
+    /**
+     * Update the formulas in specified row using the formula shifting policy specified by shifter
+     *
+     * @param row the row to update the formulas on
+     * @param formulaShifter the formula shifting policy
+     */
+    /*package*/ static void updateRowFormulas(XSSFRow row, FormulaShifter formulaShifter) {
+        XSSFSheet sheet = row.getSheet();
+        for (Cell c : row) {
+            XSSFCell cell = (XSSFCell) c;
+
+            CTCell ctCell = cell.getCTCell();
+            if (ctCell.isSetF()) {
+                CTCellFormula f = ctCell.getF();
+                String formula = f.getStringValue();
+                if (!formula.isEmpty()) {
+                    String shiftedFormula = shiftFormula(row, formula, formulaShifter);
+                    if (shiftedFormula != null) {
+                        f.setStringValue(shiftedFormula);
+                        if(f.getT() == STCellFormulaType.SHARED){
+                            int si = Math.toIntExact(f.getSi());
+                            CTCellFormula sf = sheet.getSharedFormula(si);
+                            // the sheet holds a detached copy of the master formula
+                            if (sf != null && sf != f) {
+                                sf.setStringValue(shiftedFormula);
+                                updateRefInCTCellFormula(row, formulaShifter, sf);
+                            }
+                        }
+                    }
+
+                }
+
+                //Range of cells which the formula applies to.
+                updateRefInCTCellFormula(row, formulaShifter, f);
+            }
+
+        }
+    }
+
+    /**
+     * Shift a formula using the supplied FormulaShifter
+     *
+     * @param row            the row of the cell this formula belongs to. Used to get a reference to the parent workbook.
+     * @param formula        the formula to shift
+     * @param formulaShifter the FormulaShifter object that operates on the parsed formula tokens
+     * @return the shifted formula if the formula was changed,
+     * <code>null</code> if the formula wasn't modified
+     */
+    /*package*/
+    static String shiftFormula(XSSFRow row, String formula, FormulaShifter formulaShifter) {
+        XSSFSheet sheet = row.getSheet();
+        XSSFWorkbook wb = sheet.getWorkbook();
+        final int sheetIndex = wb.getSheetIndex(sheet);
+        final int rowIndex = row.getRowNum();
+        XSSFEvaluationWorkbook fpb = XSSFEvaluationWorkbook.create(wb);
+
+        try {
+            Ptg[] ptgs = FormulaParser.parse(formula, fpb, FormulaType.CELL, sheetIndex, rowIndex);
+            String shiftedFmla = null;
+            if (formulaShifter.adjustFormula(ptgs, sheetIndex)) {
+                shiftedFmla = FormulaRenderer.toFormulaString(fpb, ptgs);
+            }
+            return shiftedFmla;
+        } catch (FormulaParseException fpe) {
+            // Log, but don't change, rather than breaking
+            LOG.atWarn().withThrowable(fpe).log("Error shifting formula on row {}", box(row.getRowNum()));
+            return formula;
+        }
+    }
+
+    /*package*/
+    static void updateRefInCTCellFormula(XSSFRow row, FormulaShifter formulaShifter, CTCellFormula f) {
+        if (f.isSetRef()) { //Range of cells which the formula applies to.
+            String ref = f.getRef();
+            String shiftedRef = shiftFormula(row, ref, formulaShifter);
+            if (shiftedRef != null) f.setRef(shiftedRef);
+        }
+    }
+
+    /*package*/ static void updateConditionalFormatting(XSSFSheet sheet, FormulaShifter formulaShifter) {
+        XSSFWorkbook wb = sheet.getWorkbook();
+        int sheetIndex = wb.getSheetIndex(sheet);
+        final int rowIndex = -1; //don't care, structured references not allowed in conditional formatting
+
+        XSSFEvaluationWorkbook fpb = XSSFEvaluationWorkbook.create(wb);
+        CTWorksheet ctWorksheet = sheet.getCTWorksheet();
+        CTConditionalFormatting[] conditionalFormattingArray = ctWorksheet.getConditionalFormattingArray();
+        // iterate backwards due to possible calls to ctWorksheet.removeConditionalFormatting(j)
+        for (int j = conditionalFormattingArray.length - 1; j >= 0; j--) {
+            CTConditionalFormatting cf = conditionalFormattingArray[j];
+
+            ArrayList<CellRangeAddress> cellRanges = new ArrayList<>();
+            for (Object stRef : cf.getSqref()) {
+                String[] regions = stRef.toString().split(" ");
+                for (String region : regions) {
+                    cellRanges.add(CellRangeAddress.valueOf(region));
+                }
+            }
+
+            boolean changed = false;
+            List<CellRangeAddress> temp = new ArrayList<>();
+            for (CellRangeAddress craOld : cellRanges) {
+                CellRangeAddress craNew = BaseRowColShifter.shiftRange(formulaShifter, craOld, sheetIndex);
+                if (craNew == null) {
+                    changed = true;
+                    continue;
+                }
+                temp.add(craNew);
+                if (craNew != craOld) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                int nRanges = temp.size();
+                if (nRanges == 0) {
+                    ctWorksheet.removeConditionalFormatting(j);
+                    continue;
+                }
+                List<String> refs = new ArrayList<>();
+                for(CellRangeAddress a : temp) refs.add(a.formatAsString());
+                cf.setSqref(refs);
+            }
+
+            for(CTCfRule cfRule : cf.getCfRuleArray()){
+                String[] formulaArray = cfRule.getFormulaArray();
+                for (int i = 0; i < formulaArray.length; i++) {
+                    String formula = formulaArray[i];
+                    Ptg[] ptgs = FormulaParser.parse(formula, fpb, FormulaType.CELL, sheetIndex, rowIndex);
+                    if (formulaShifter.adjustFormula(ptgs, sheetIndex)) {
+                        String shiftedFmla = FormulaRenderer.toFormulaString(fpb, ptgs);
+                        cfRule.setFormulaArray(i, shiftedFmla);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /*package*/ static void updateHyperlinks(XSSFSheet sheet, FormulaShifter formulaShifter) {
+        final int sheetIndex = sheet.getWorkbook().getSheetIndex(sheet);
+
+        for (XSSFHyperlink hyperlink : sheet.getHyperlinkList()) {
+            String cellRef = hyperlink.getCellRef();
+            CellRangeAddress cra = CellRangeAddress.valueOf(cellRef);
+            CellRangeAddress shiftedRange = BaseRowColShifter.shiftRange(formulaShifter, cra, sheetIndex);
+            if (shiftedRange != null && shiftedRange != cra) {
+                // shiftedRange should not be null. If shiftedRange is null, that means
+                // that a hyperlink wasn't deleted at the beginning of shiftRows when
+                // identifying rows that should be removed because they will be overwritten
+                hyperlink.setCellReference(shiftedRange.formatAsString());
+            }
+        }
+    }
+
+    /**
+     * Shift the anchors of the shapes (charts, pictures, ...) in the sheet's drawing along with the rows
+     * they are anchored to. A shape is moved when its top-left anchor row is within {@code [startRow, endRow]};
+     * the whole shape is moved so it keeps its size (Excel's "move but don't size with cells").
+     * Shapes with an absolute anchor are not moved.
+     */
+    /*package*/ static void shiftDrawingAnchorRows(XSSFSheet sheet, int startRow, int endRow, int n) {
+        shiftDrawingAnchors(sheet, startRow, endRow, n, true);
+    }
+
+    /**
+     * Shift the anchors of the shapes (charts, pictures, ...) in the sheet's drawing along with the columns
+     * they are anchored to. A shape is moved when its top-left anchor column is within
+     * {@code [startColumn, endColumn]}; the whole shape is moved so it keeps its size.
+     * Shapes with an absolute anchor are not moved.
+     */
+    /*package*/ static void shiftDrawingAnchorColumns(XSSFSheet sheet, int startColumn, int endColumn, int n) {
+        shiftDrawingAnchors(sheet, startColumn, endColumn, n, false);
+    }
+
+    private static void shiftDrawingAnchors(XSSFSheet sheet, int start, int end, int n, boolean rows) {
+        if (n == 0) {
+            return;
+        }
+        XSSFDrawing drawing = sheet.getDrawingPatriarch();
+        if (drawing == null) {
+            return;
+        }
+        CTDrawing ctDrawing = drawing.getCTDrawing();
+        for (CTTwoCellAnchor anchor : ctDrawing.getTwoCellAnchorList()) {
+            if (isInRange(anchor.getFrom(), start, end, rows)) {
+                shiftMarker(anchor.getFrom(), n, rows);
+                shiftMarker(anchor.getTo(), n, rows);
+            }
+        }
+        for (CTOneCellAnchor anchor : ctDrawing.getOneCellAnchorList()) {
+            if (isInRange(anchor.getFrom(), start, end, rows)) {
+                shiftMarker(anchor.getFrom(), n, rows);
+            }
+        }
+        // absolute anchors are positioned in EMUs, not cells, so they don't move with rows or columns
+    }
+
+    private static boolean isInRange(CTMarker marker, int start, int end, boolean rows) {
+        int idx = rows ? marker.getRow() : marker.getCol();
+        return idx >= start && idx <= end;
+    }
+
+    private static void shiftMarker(CTMarker marker, int n, boolean rows) {
+        if (rows) {
+            marker.setRow(clip(marker.getRow() + n, SpreadsheetVersion.EXCEL2007.getLastRowIndex()));
+        } else {
+            marker.setCol(clip(marker.getCol() + n, SpreadsheetVersion.EXCEL2007.getLastColumnIndex()));
+        }
+    }
+
+    private static int clip(int idx, int max) {
+        return Math.min(Math.max(0, idx), max);
+    }
+}

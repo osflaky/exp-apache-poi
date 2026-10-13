@@ -1,0 +1,297 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.ss.formula.functions;
+
+import static org.apache.poi.ss.formula.eval.ErrorEval.VALUE_INVALID;
+
+import org.apache.poi.ss.formula.eval.*;
+import org.apache.poi.ss.util.ExcelArithmetic;
+import org.apache.poi.util.LocaleUtil;
+import org.apache.poi.util.StringUtil;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.text.DecimalFormat;
+import java.text.NumberFormat;
+import java.util.concurrent.ThreadLocalRandom;
+
+public abstract class NumericFunction implements Function {
+
+    private static final double ZERO = 0.0;
+    private static final double TEN = 10.0;
+    private static final double LOG_10_TO_BASE_e = Math.log(TEN);
+
+    /**
+     * Excel refuses more than 127 decimal places in DOLLAR and FIXED (#VALUE!)
+     */
+    static final int MAX_FORMATTED_DECIMALS = 127;
+    /**
+     * Rounding to fewer than this many places (i.e. to a multiple of 10^400) can only give 0 for
+     * any double, so smaller counts are clamped: they would otherwise make BigDecimal build a
+     * power of ten with billions of digits.
+     */
+    static final int MIN_FORMATTED_DECIMALS = -400;
+
+
+    protected static double singleOperandEvaluate(ValueEval arg, int srcRowIndex, int srcColumnIndex) throws EvaluationException {
+        if (arg == null) {
+            throw new IllegalArgumentException("arg must not be null");
+        }
+        ValueEval ve = OperandResolver.getSingleValue(arg, srcRowIndex, srcColumnIndex);
+        double result = OperandResolver.coerceValueToDouble(ve);
+        checkValue(result);
+        return result;
+    }
+
+    /**
+     * @throws EvaluationException (#NUM!) if {@code result} is {@code NaN} or {@code Infinity}
+     */
+    public static void checkValue(double result) throws EvaluationException {
+        if (Double.isNaN(result) || Double.isInfinite(result)) {
+            throw new EvaluationException(ErrorEval.NUM_ERROR);
+        }
+    }
+
+    @Override
+    public final ValueEval evaluate(ValueEval[] args, int srcCellRow, int srcCellCol) {
+        double result;
+        try {
+            result = eval(args, srcCellRow, srcCellCol);
+            checkValue(result);
+        } catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+        return new NumberEval(result);
+    }
+
+    protected abstract double eval(ValueEval[] args, int srcCellRow, int srcCellCol) throws EvaluationException;
+
+    public static final Function ABS = oneDouble(Math::abs);
+    public static final Function ACOS = oneDouble(Math::acos);
+    public static final Function ACOSH = oneDouble(MathX::acosh);
+    public static final Function ASIN = oneDouble(Math::asin);
+    public static final Function ASINH = oneDouble(MathX::asinh);
+    public static final Function ATAN = oneDouble(Math::atan);
+    public static final Function ATANH = oneDouble(MathX::atanh);
+    public static final Function COS = oneDouble(Math::cos);
+    public static final Function COSH = oneDouble(MathX::cosh);
+    public static final Function DEGREES = oneDouble(Math::toDegrees);
+    public static final Function DOLLAR = NumericFunction::evaluateDollar;
+
+    private static ValueEval evaluateDollar(ValueEval[] args, int srcRowIndex, int srcColumnIndex) {
+        if (args.length != 1 && args.length != 2) {
+            return ErrorEval.VALUE_INVALID;
+        }
+        try {
+            double val = singleOperandEvaluate(args[0], srcRowIndex, srcColumnIndex);
+            double d1 = args.length == 1 ? 2.0 : singleOperandEvaluate(args[1], srcRowIndex, srcColumnIndex);
+
+            if (d1 > MAX_FORMATTED_DECIMALS) {
+                return VALUE_INVALID;
+            }
+            // second arg converts to int by truncating toward zero
+            int nPlaces = OperandResolver.coerceDoubleToInt(d1);
+
+            // Excel rounds half away from zero on its 15-digit view: DOLLAR(2.675,2) is $2.68 and
+            // DOLLAR(1550,-2) is $1,600. Rounded as a decimal, and formatted as one, so that the
+            // binary value never shows through.
+            BigDecimal rounded = ExcelArithmetic.toBigDecimal(val)
+                    .setScale(Math.max(nPlaces, MIN_FORMATTED_DECIMALS), RoundingMode.HALF_UP);
+
+            DecimalFormat nf = (DecimalFormat) NumberFormat.getCurrencyInstance(LocaleUtil.getUserLocale());
+            int decimalPlaces = Math.max(nPlaces, 0);
+            if (StringUtil.equalsIgnoreCase(LocaleUtil.getUserLocale().getCountry(), "US")) {
+                // Java 23 removed "COMPAT" locale provider and thus
+                // we need to ensure that the dollar-sign is used and not "USD" as Java 23 and newer
+                // would do
+                nf.setPositivePrefix("$");
+                nf.setNegativePrefix("($");
+                nf.setNegativeSuffix(")");
+            }
+            nf.setMinimumFractionDigits(decimalPlaces);
+            nf.setMaximumFractionDigits(decimalPlaces);
+
+            return new StringEval(nf.format(rounded).replace("\u00a0"," "));
+        } catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+    }
+
+    public static final Function EXP = oneDouble(d -> Math.pow(Math.E, d));
+    public static final Function FACT = oneDouble(MathX::factorial);
+    //https://support.microsoft.com/en-us/office/int-function-a6c4af9e-356d-4369-ab6a-cb1fd9d343ef
+    public static final Function INT = oneDouble(d -> Math.floor(ExcelArithmetic.approxValue(d)));
+    public static final Function LN = oneDouble(Math::log);
+    public static final Function LOG10 = oneDouble(d -> Math.log(d) / LOG_10_TO_BASE_e);
+    public static final Function RADIANS = oneDouble(Math::toRadians);
+    public static final Function SIGN = oneDouble(MathX::sign);
+    public static final Function SIN = oneDouble(Math::sin);
+    public static final Function SINH = oneDouble(MathX::sinh);
+    public static final Function SQRT = oneDouble(Math::sqrt);
+    public static final Function TAN = oneDouble(Math::tan);
+    public static final Function TANH = oneDouble(MathX::tanh);
+
+    /* -------------------------------------------------------------------------- */
+
+    public static final Function ATAN2 = twoDouble((d0, d1) ->
+        (d0 == ZERO && d1 == ZERO) ? ErrorEval.DIV_ZERO : Math.atan2(d1, d0)
+    );
+
+    public static final Function CEILING = twoDouble(MathX::ceiling);
+
+    public static final Function COMBIN = twoDouble((d0, d1) -> {
+        // Excel truncates both arguments, on its 15-digit view
+        double n = ExcelArithmetic.truncate(d0);
+        double k = ExcelArithmetic.truncate(d1);
+        if (Math.abs(n) > Integer.MAX_VALUE || Math.abs(k) > Integer.MAX_VALUE) {
+            return ErrorEval.NUM_ERROR;
+        }
+        return MathX.nChooseK((int) n, (int) k);
+    });
+
+    public static final Function FLOOR = twoDouble((d0, d1) ->
+        (d1 == ZERO) ? (d0 == ZERO ? ZERO : ErrorEval.DIV_ZERO) : MathX.floor(d0, d1));
+
+    public static final Function MOD = twoDouble((d0, d1) ->
+        (d1 == ZERO) ? ErrorEval.DIV_ZERO : MathX.mod(d0, d1));
+
+    public static final Function POWER = twoDouble((d0, d1) -> {
+        if (d0 == ZERO) {
+            // Excel: POWER(0,0) is #NUM! and POWER(0,negative) is #DIV/0! (Math.pow gives 1 and Infinity)
+            if (d1 == ZERO) {
+                return ErrorEval.NUM_ERROR;
+            }
+            if (d1 < ZERO) {
+                return ErrorEval.DIV_ZERO;
+            }
+        }
+        return Math.pow(d0, d1);
+    });
+
+    public static final Function ROUND = twoDouble(MathX::round);
+    public static final Function ROUNDDOWN = twoDouble(MathX::roundDown);
+    public static final Function ROUNDUP = twoDouble(MathX::roundUp);
+    public static final Function TRUNC = NumericFunction::evaluateTrunc;
+
+    private static ValueEval evaluateTrunc(ValueEval[] args, int srcRowIndex, int srcColumnIndex) {
+        if (args.length != 1 && args.length != 2) {
+            return ErrorEval.VALUE_INVALID;
+        }
+        try {
+            double d0 = singleOperandEvaluate(args[0], srcRowIndex, srcColumnIndex);
+            double d1 = args.length == 1 ? 0 : singleOperandEvaluate(args[1], srcRowIndex, srcColumnIndex);
+            double result = MathX.roundDown(d0, d1);
+            checkValue(result);
+            return new NumberEval(result);
+        }catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+    }
+
+    /* -------------------------------------------------------------------------- */
+
+    public static final Function LOG = Log::evaluate;
+
+    static final NumberEval PI_EVAL = new NumberEval(Math.PI);
+    public static final Function PI = NumericFunction::evaluatePI;
+
+    private static ValueEval evaluatePI(ValueEval[] args, int srcRowIndex, int srcColumnIndex) {
+        return (args.length != 0) ? ErrorEval.VALUE_INVALID : PI_EVAL;
+    }
+
+    public static final Function RAND = NumericFunction::evaluateRand;
+
+    private static ValueEval evaluateRand(ValueEval[] args, int srcRowIndex, int srcColumnIndex) {
+        return (args.length != 0) ? ErrorEval.VALUE_INVALID : new NumberEval(ThreadLocalRandom.current().nextDouble());
+    }
+
+    public static final Function POISSON = Poisson::evaluate;
+
+    //https://support.microsoft.com/en-us/office/odd-function-deae64eb-e08a-4c88-8b40-6d0b42575c98
+    public static final Function ODD = oneDouble(NumericFunction::evaluateOdd);
+
+    private static double evaluateOdd(double d) {
+        return roundAwayFromZero(d, 1);
+    }
+
+    //https://support.microsoft.com/en-us/office/even-function-197b5f06-c795-4c1e-8696-3c3b8a646cf9
+    public static final Function EVEN = oneDouble(NumericFunction::evaluateEven);
+
+    private static double evaluateEven(double d) {
+        return roundAwayFromZero(d, 0);
+    }
+
+    /**
+     * Rounds away from zero to the nearest integer with the given parity, e.g. 1.5 to 3 (odd) or 2 (even)
+     * and -1.5 to -3 or -2. Like INT and CEILING this acts on the 15 significant digits Excel exposes, so
+     * 2.0000000000000004 is treated as 2. Computed in doubles so that magnitudes beyond the long range work.
+     */
+    private static double roundAwayFromZero(double d, int parity) {
+        double m = Math.ceil(Math.abs(ExcelArithmetic.approxValue(d)));
+        if (m % 2 != parity) {
+            m += 1;
+        }
+        return d < 0 ? -m : m;
+    }
+
+
+    private interface OneDoubleIf {
+        double apply(double d);
+    }
+
+    private static Function oneDouble(OneDoubleIf doubleFun) {
+        return (args, srcCellRow, srcCellCol) -> {
+            if (args.length != 1) {
+                return VALUE_INVALID;
+            }
+            try {
+                double d = singleOperandEvaluate(args[0], srcCellRow, srcCellCol);
+                double res = doubleFun.apply(d);
+                return (Double.isNaN(res) || Double.isInfinite(res)) ? ErrorEval.NUM_ERROR : new NumberEval(res);
+            } catch (EvaluationException e) {
+                return e.getErrorEval();
+            }
+        };
+    }
+
+    private interface TwoDoubleIf {
+        Object apply(double d1, double d2);
+    }
+
+    private static Function twoDouble(TwoDoubleIf doubleFun) {
+        return (args, srcCellRow, srcCellCol) -> {
+            if (args.length != 2) {
+                return VALUE_INVALID;
+            }
+            try {
+                double d1 = singleOperandEvaluate(args[0], srcCellRow, srcCellCol);
+                double d2 = singleOperandEvaluate(args[1], srcCellRow, srcCellCol);
+                Object res = doubleFun.apply(d1, d2);
+                if (res instanceof ErrorEval ee) {
+                    return ee;
+                }
+                if (!(res instanceof Double d)) {
+                    throw new AssertionError("Expected Double");
+                }
+                return (Double.isNaN(d) || Double.isInfinite(d)) ? ErrorEval.NUM_ERROR : new NumberEval(d);
+            } catch (EvaluationException e) {
+                return e.getErrorEval();
+            }
+        };
+    }
+}

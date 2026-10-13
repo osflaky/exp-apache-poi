@@ -1,0 +1,264 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.xssf.usermodel;
+
+import static org.apache.poi.util.Units.EMU_PER_PIXEL;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.awt.Dimension;
+import java.io.IOException;
+import java.util.List;
+
+import org.apache.poi.openxml4j.opc.ZipPackage;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.ClientAnchor.AnchorType;
+import org.apache.poi.ss.usermodel.Shape;
+import org.apache.poi.ss.util.ImageUtils;
+import org.apache.poi.util.LocaleUtil;
+import org.apache.poi.xssf.XSSFITestDataProvider;
+import org.apache.poi.xssf.XSSFTestDataSamples;
+import org.junit.jupiter.api.Test;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.CTTwoCellAnchor;
+import org.openxmlformats.schemas.drawingml.x2006.spreadsheetDrawing.STEditAs;
+
+public final class TestXSSFPicture extends BaseTestPicture {
+
+    public TestXSSFPicture() {
+        super(XSSFITestDataProvider.instance);
+    }
+
+    @Override
+    protected Picture getPictureShape(Drawing<?> pat, int picIdx) {
+        return (Picture)((XSSFDrawing)pat).getShapes().get(picIdx);
+    }
+
+    @Test
+    void create() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            XSSFDrawing drawing = sheet.createDrawingPatriarch();
+
+            byte[] jpegData = "test jpeg data".getBytes(LocaleUtil.CHARSET_1252);
+
+            List<XSSFPictureData> pictures = wb.getAllPictures();
+            assertEquals(0, pictures.size());
+
+            int jpegIdx = wb.addPicture(jpegData, XSSFWorkbook.PICTURE_TYPE_JPEG);
+            assertEquals(1, pictures.size());
+            assertEquals("jpeg", pictures.get(jpegIdx).suggestFileExtension());
+            assertArrayEquals(jpegData, pictures.get(jpegIdx).getData());
+
+            XSSFClientAnchor anchor = new XSSFClientAnchor(0, 0, 0, 0, 1, 1, 10, 30);
+            assertEquals(AnchorType.MOVE_AND_RESIZE, anchor.getAnchorType());
+            anchor.setAnchorType(AnchorType.DONT_MOVE_AND_RESIZE);
+            assertEquals(AnchorType.DONT_MOVE_AND_RESIZE, anchor.getAnchorType());
+
+            XSSFPicture shape = drawing.createPicture(anchor, jpegIdx);
+            assertEquals(anchor, shape.getAnchor());
+            assertNotNull(shape.getPictureData());
+            assertArrayEquals(jpegData, shape.getPictureData().getData());
+
+            CTTwoCellAnchor ctShapeHolder = drawing.getCTDrawing().getTwoCellAnchorArray(0);
+            // STEditAs.ABSOLUTE corresponds to ClientAnchor.DONT_MOVE_AND_RESIZE
+            assertSame(STEditAs.ABSOLUTE, ctShapeHolder.getEditAs());
+        }
+    }
+
+    /**
+     * test that ShapeId in CTNonVisualDrawingProps is incremented
+     *
+     * See Bugzilla 50458
+     */
+    @Test
+    void incrementShapeId() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            XSSFDrawing drawing = sheet.createDrawingPatriarch();
+
+            XSSFClientAnchor anchor = new XSSFClientAnchor(0, 0, 0, 0, 1, 1, 10, 30);
+            byte[] jpegData = "picture1".getBytes(LocaleUtil.CHARSET_1252);
+            int jpegIdx = wb.addPicture(jpegData, XSSFWorkbook.PICTURE_TYPE_JPEG);
+
+            XSSFPicture shape1 = drawing.createPicture(anchor, jpegIdx);
+            assertEquals(1, shape1.getCTPicture().getNvPicPr().getCNvPr().getId());
+
+            jpegData = "picture2".getBytes(LocaleUtil.CHARSET_1252);
+            jpegIdx = wb.addPicture(jpegData, XSSFWorkbook.PICTURE_TYPE_JPEG);
+            XSSFPicture shape2 = drawing.createPicture(anchor, jpegIdx);
+            assertEquals(2, shape2.getCTPicture().getNvPicPr().getCNvPr().getId());
+        }
+    }
+
+    /**
+     * same image referred to by multiple sheets
+     */
+    @Test
+    void multiRelationships() throws IOException {
+        multiRelationships(false, false);
+    }
+
+    @Test
+    void multiRelationshipsWithTempFileParts() throws IOException {
+        multiRelationships(true, false);
+    }
+
+    @Test
+    void multiRelationshipsWithEncryptedTempFileParts() throws IOException {
+        multiRelationships(true, true);
+    }
+
+    private void multiRelationships(boolean tempFileParts, boolean encrypt) throws IOException {
+        final boolean originalTempFileSetting = ZipPackage.useTempFilePackageParts();
+        final boolean originalEncryptSetting = ZipPackage.encryptTempFilePackageParts();
+        try {
+            ZipPackage.setUseTempFilePackageParts(tempFileParts);
+            ZipPackage.setEncryptTempFilePackageParts(encrypt);
+            try (XSSFWorkbook wb1 = new XSSFWorkbook()) {
+                byte[] pic1Data = "test jpeg data".getBytes(LocaleUtil.CHARSET_1252);
+                byte[] pic2Data = "test png data".getBytes(LocaleUtil.CHARSET_1252);
+
+                List<XSSFPictureData> pictures = wb1.getAllPictures();
+                assertEquals(0, pictures.size());
+
+                int pic1 = wb1.addPicture(pic1Data, XSSFWorkbook.PICTURE_TYPE_JPEG);
+                int pic2 = wb1.addPicture(pic2Data, XSSFWorkbook.PICTURE_TYPE_PNG);
+
+                XSSFSheet sheet1 = wb1.createSheet();
+                XSSFDrawing drawing1 = sheet1.createDrawingPatriarch();
+                XSSFPicture shape1 = drawing1.createPicture(new XSSFClientAnchor(), pic1);
+                XSSFPicture shape2 = drawing1.createPicture(new XSSFClientAnchor(), pic2);
+
+                XSSFSheet sheet2 = wb1.createSheet();
+                XSSFDrawing drawing2 = sheet2.createDrawingPatriarch();
+                XSSFPicture shape3 = drawing2.createPicture(new XSSFClientAnchor(), pic2);
+                XSSFPicture shape4 = drawing2.createPicture(new XSSFClientAnchor(), pic1);
+
+                assertEquals(2, pictures.size());
+
+                try (XSSFWorkbook wb2 = XSSFTestDataSamples.writeOutAndReadBack(wb1)) {
+                    pictures = wb2.getAllPictures();
+                    assertEquals(2, pictures.size());
+
+                    sheet1 = wb2.getSheetAt(0);
+                    drawing1 = sheet1.createDrawingPatriarch();
+                    XSSFPicture shape11 = (XSSFPicture) drawing1.getShapes().get(0);
+                    assertArrayEquals(shape1.getPictureData().getData(), shape11.getPictureData().getData());
+                    XSSFPicture shape22 = (XSSFPicture) drawing1.getShapes().get(1);
+                    assertArrayEquals(shape2.getPictureData().getData(), shape22.getPictureData().getData());
+
+                    sheet2 = wb2.getSheetAt(1);
+                    drawing2 = sheet2.createDrawingPatriarch();
+                    XSSFPicture shape33 = (XSSFPicture) drawing2.getShapes().get(0);
+                    assertArrayEquals(shape3.getPictureData().getData(), shape33.getPictureData().getData());
+                    XSSFPicture shape44 = (XSSFPicture) drawing2.getShapes().get(1);
+                    assertArrayEquals(shape4.getPictureData().getData(), shape44.getPictureData().getData());
+                }
+            }
+        } finally {
+            ZipPackage.setUseTempFilePackageParts(originalTempFileSetting);
+            ZipPackage.setEncryptTempFilePackageParts(originalEncryptSetting);
+        }
+    }
+
+    /**
+     * Degenerate in-cell XSSF anchors (col1 == col2, dx1 == dx2 == 0) must report the
+     * full cell size so picture.resize() has a positive base dimension. See #1201.
+     */
+    @Test
+    void testGetDimensionFromAnchorDegenerateInCell() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            byte[] png = XSSFITestDataProvider.instance.getTestDataFileContent("45829.png");
+            int idx = wb.addPicture(png, Workbook.PICTURE_TYPE_PNG);
+
+            XSSFClientAnchor anchor = new XSSFClientAnchor(0, 0, 0, 0, 1, 1, 1, 1);
+            XSSFDrawing drawing = sheet.createDrawingPatriarch();
+            XSSFPicture picture = drawing.createPicture(anchor, idx);
+
+            int expectedWidth = Math.round(sheet.getColumnWidthInPixels(1) * EMU_PER_PIXEL);
+            int expectedHeight = (int) Math.round(ImageUtils.getRowHeightInPixels(sheet, 1) * EMU_PER_PIXEL);
+
+            Dimension dim = ImageUtils.getDimensionFromAnchor(picture);
+            assertEquals(expectedWidth, dim.getWidth(), "degenerate in-cell width should equal cell width");
+            assertEquals(expectedHeight, dim.getHeight(), "degenerate in-cell height should equal cell height");
+
+            picture.resize(1.0, 1.0);
+            Dimension afterResize = ImageUtils.getDimensionFromAnchor(picture);
+            assertTrue(afterResize.getWidth() > 0, "width should stay positive after resize");
+            assertTrue(afterResize.getHeight() > 0, "height should stay positive after resize");
+        }
+    }
+
+    /**
+     * Normal in-cell XSSF anchors with startD &lt; endD must report endD - startD.
+     */
+    @Test
+    void testGetDimensionFromAnchorInCellWithOffsets() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            int startD = 100_000;
+            int endD = 350_000;
+            XSSFClientAnchor anchor = new XSSFClientAnchor(startD, startD, endD, endD, 1, 1, 1, 1);
+
+            Dimension dim = ImageUtils.getDimensionFromAnchor(anchor, sheet);
+            assertEquals(endD - startD, dim.getWidth(), "in-cell width should be endD - startD");
+            assertEquals(endD - startD, dim.getHeight(), "in-cell height should be endD - startD");
+        }
+    }
+
+    /**
+     * Multi-cell XSSF anchors with dx2/dy2 == 0 must not include a full extra cell.
+     */
+    @Test
+    void testGetDimensionFromAnchorMultiCellZeroEndOffset() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            XSSFClientAnchor anchor = new XSSFClientAnchor(0, 0, 0, 0, 1, 1, 2, 1);
+
+            Dimension dim = ImageUtils.getDimensionFromAnchor(anchor, sheet);
+            int col1Emu = Math.round(sheet.getColumnWidthInPixels(1) * EMU_PER_PIXEL);
+            int col2Emu = Math.round(sheet.getColumnWidthInPixels(2) * EMU_PER_PIXEL);
+
+            assertEquals(col1Emu, dim.getWidth(),
+                "width must equal first column only when dx2 == 0 on second column");
+            assertNotEquals(col1Emu + col2Emu, dim.getWidth(),
+                "width must not include full second column when dx2 == 0");
+        }
+    }
+
+    @Test
+    void testGetDimensionFromAnchor() throws IOException {
+        try (Workbook wb = _testDataProvider.openSampleWorkbook("picture-and-shape-same-size.xlsx")) {
+            Sheet sh = wb.getSheetAt(0);
+            Drawing<?> pat = sh.createDrawingPatriarch();
+
+            Shape shape = ((XSSFDrawing)pat).getShapes().get(0);
+            Dimension shapeDimension = ImageUtils.getDimensionFromAnchor((ClientAnchor) shape.getAnchor(), sh);
+            Picture picture = getPictureShape(pat, 1);
+            Dimension pictureDimension = ImageUtils.getDimensionFromAnchor(picture);
+
+            assertEquals(shapeDimension.getHeight(), pictureDimension.getHeight(), "the image height differs");
+            assertEquals(shapeDimension.getWidth(), pictureDimension.getWidth(), "the image width differs");
+        }
+    }
+}

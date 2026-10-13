@@ -1,0 +1,255 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+package org.apache.poi.xddf.usermodel.chart;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+
+import org.apache.poi.ss.util.CellRangeAddress;
+import org.apache.poi.ss.util.SheetBuilder;
+import org.apache.poi.xssf.usermodel.XSSFCell;
+import org.apache.poi.xssf.usermodel.XSSFCellStyle;
+import org.apache.poi.xssf.usermodel.XSSFDataFormat;
+import org.apache.poi.xssf.usermodel.XSSFRow;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.junit.jupiter.api.Test;
+import org.openxmlformats.schemas.drawingml.x2006.chart.CTAxDataSource;
+import org.openxmlformats.schemas.drawingml.x2006.chart.CTNumData;
+import org.openxmlformats.schemas.drawingml.x2006.chart.CTNumDataSource;
+import org.openxmlformats.schemas.drawingml.x2006.chart.CTStrData;
+
+/**
+ * Tests for {@link XDDFDataSourcesFactory}.
+ */
+class TestXDDFDataSourcesFactory {
+
+    private static final Object[][] numericCells = {
+            {0.0,      1.0,       2.0,     3.0,      4.0},
+            {0.0, "=B1*2",  "=C1*2", "=D1*2", "=E1*2"}
+    };
+
+    private static final Object[][] stringCells = {
+            {  1,    2,    3,   4,    5},
+            {"A", "B", "C", "D", "E"}
+    };
+
+    private static final Object[][] mixedCells = {
+            {1.0, "2.0", 3.0, "4.0", 5.0, "6.0"}
+    };
+
+    @Test
+    void testNumericArrayDataSource() {
+        Double[] doubles = new Double[]{1.0, 2.0, 3.0, 4.0, 5.0};
+        XDDFDataSource<Double> doubleDataSource = XDDFDataSourcesFactory.fromArray(doubles, null);
+        assertTrue(doubleDataSource.isNumeric());
+        assertFalse(doubleDataSource.isReference());
+        assertDataSourceIsEqualToArray(doubleDataSource, doubles);
+    }
+
+    @Test
+    void testStringArrayDataSource() {
+        String[] strings = new String[]{"one", "two", "three", "four", "five"};
+        XDDFDataSource<String> stringDataSource = XDDFDataSourcesFactory.fromArray(strings, null);
+        assertFalse(stringDataSource.isNumeric());
+        assertFalse(stringDataSource.isReference());
+        assertDataSourceIsEqualToArray(stringDataSource, strings);
+    }
+
+    @Test
+    void testNumericCellDataSource() {
+        XSSFWorkbook wb = new XSSFWorkbook();
+        XSSFSheet sheet = (XSSFSheet) new SheetBuilder(wb, numericCells).build();
+        CellRangeAddress numCellRange = CellRangeAddress.valueOf("A2:E2");
+        XDDFDataSource<Double> numDataSource = XDDFDataSourcesFactory.fromNumericCellRange(sheet, numCellRange);
+        assertTrue(numDataSource.isReference());
+        assertTrue(numDataSource.isNumeric());
+        assertEquals(numericCells[0].length, numDataSource.getPointCount());
+        for (int i = 0; i < numericCells[0].length; ++i) {
+            assertEquals(((Double) numericCells[0][i]) * 2,
+                    numDataSource.getPointAt(i), 0.00001);
+        }
+    }
+
+    @Test
+    void testStringCellDataSource() {
+        XSSFWorkbook wb = new XSSFWorkbook();
+        XSSFSheet sheet = (XSSFSheet) new SheetBuilder(wb, stringCells).build();
+        CellRangeAddress numCellRange = CellRangeAddress.valueOf("A2:E2");
+        XDDFDataSource<String> numDataSource = XDDFDataSourcesFactory.fromStringCellRange(sheet, numCellRange);
+        assertTrue(numDataSource.isReference());
+        assertFalse(numDataSource.isNumeric());
+        assertEquals(numericCells[0].length, numDataSource.getPointCount());
+        for (int i = 0; i < stringCells[1].length; ++i) {
+            assertEquals(stringCells[1][i], numDataSource.getPointAt(i));
+        }
+    }
+
+    @Test
+    void testMixedCellDataSource() {
+        XSSFWorkbook wb = new XSSFWorkbook();
+        XSSFSheet sheet = (XSSFSheet) new SheetBuilder(wb, mixedCells).build();
+        CellRangeAddress mixedCellRange = CellRangeAddress.valueOf("A1:F1");
+        XDDFDataSource<String> strDataSource = XDDFDataSourcesFactory.fromStringCellRange(sheet, mixedCellRange);
+        XDDFDataSource<Double> numDataSource = XDDFDataSourcesFactory.fromNumericCellRange(sheet, mixedCellRange);
+        for (int i = 0; i < mixedCells[0].length; ++i) {
+            if (i % 2 == 0) {
+                assertNull(strDataSource.getPointAt(i));
+                assertEquals(((Double) mixedCells[0][i]),
+                        numDataSource.getPointAt(i), 0.00001);
+            } else {
+                assertNull(numDataSource.getPointAt(i));
+                assertEquals(mixedCells[0][i], strDataSource.getPointAt(i));
+            }
+        }
+    }
+
+    @Test
+    void testIOBExceptionOnInvalidIndex() {
+        XSSFWorkbook wb = new XSSFWorkbook();
+        XSSFSheet sheet = (XSSFSheet) new SheetBuilder(wb, numericCells).build();
+        CellRangeAddress rangeAddress = CellRangeAddress.valueOf("A2:E2");
+        XDDFDataSource<Double> numDataSource = XDDFDataSourcesFactory.fromNumericCellRange(sheet, rangeAddress);
+        IndexOutOfBoundsException exception = null;
+        try {
+            numDataSource.getPointAt(-1);
+        } catch (IndexOutOfBoundsException e) {
+            exception = e;
+        }
+        assertNotNull(exception);
+
+        exception = null;
+        try {
+            numDataSource.getPointAt(numDataSource.getPointCount());
+        } catch (IndexOutOfBoundsException e) {
+            exception = e;
+        }
+        assertNotNull(exception);
+    }
+
+    @Test
+    void oversizedCategoryPointCountIsRejected() {
+        // A crafted chart cache with an unsignedInt ptCount > Integer.MAX_VALUE
+        // must not silently truncate to a negative int during conversion.
+        long oversized = (long) Integer.MAX_VALUE + 1;
+
+        CTAxDataSource numRefDS = CTAxDataSource.Factory.newInstance();
+        CTNumData numCache = numRefDS.addNewNumRef().addNewNumCache();
+        numCache.addNewPtCount().setVal(oversized);
+        XDDFCategoryDataSource numRefSource = XDDFDataSourcesFactory.fromDataSource(numRefDS);
+        assertThrows(ArithmeticException.class, numRefSource::getPointCount);
+
+        CTAxDataSource strRefDS = CTAxDataSource.Factory.newInstance();
+        CTStrData strCache = strRefDS.addNewStrRef().addNewStrCache();
+        strCache.addNewPtCount().setVal(oversized);
+        XDDFCategoryDataSource strRefSource = XDDFDataSourcesFactory.fromDataSource(strRefDS);
+        assertThrows(ArithmeticException.class, strRefSource::getPointCount);
+
+        CTAxDataSource numLitDS = CTAxDataSource.Factory.newInstance();
+        numLitDS.addNewNumLit().addNewPtCount().setVal(oversized);
+        XDDFCategoryDataSource numLitSource = XDDFDataSourcesFactory.fromDataSource(numLitDS);
+        assertThrows(ArithmeticException.class, numLitSource::getPointCount);
+
+        CTAxDataSource strLitDS = CTAxDataSource.Factory.newInstance();
+        strLitDS.addNewStrLit().addNewPtCount().setVal(oversized);
+        XDDFCategoryDataSource strLitSource = XDDFDataSourcesFactory.fromDataSource(strLitDS);
+        assertThrows(ArithmeticException.class, strLitSource::getPointCount);
+    }
+
+    @Test
+    void oversizedValuesPointCountIsRejected() {
+        long oversized = (long) Integer.MAX_VALUE + 1;
+
+        CTNumDataSource numRefDS = CTNumDataSource.Factory.newInstance();
+        CTNumData numCache = numRefDS.addNewNumRef().addNewNumCache();
+        numCache.addNewPtCount().setVal(oversized);
+        XDDFNumericalDataSource<Double> numRefSource = XDDFDataSourcesFactory.fromDataSource(numRefDS);
+        assertThrows(ArithmeticException.class, numRefSource::getPointCount);
+
+        CTNumDataSource numLitDS = CTNumDataSource.Factory.newInstance();
+        numLitDS.addNewNumLit().addNewPtCount().setVal(oversized);
+        XDDFNumericalDataSource<Double> numLitSource = XDDFDataSourcesFactory.fromDataSource(numLitDS);
+        assertThrows(ArithmeticException.class, numLitSource::getPointCount);
+    }
+
+    @Test
+    void testNumericCellRangeFormatCodes() throws IOException {
+        try (XSSFWorkbook wb = new XSSFWorkbook()) {
+            XSSFSheet sheet = wb.createSheet();
+            XSSFDataFormat dataFormat = wb.createDataFormat();
+
+            XSSFCellStyle decimalStyle = wb.createCellStyle();
+            decimalStyle.setDataFormat(dataFormat.getFormat("#,##0.###"));
+            XSSFCellStyle intStyle = wb.createCellStyle();
+            intStyle.setDataFormat(dataFormat.getFormat("#,##0"));
+
+            XSSFRow row = sheet.createRow(0);
+            XSSFCell c0 = row.createCell(0);
+            c0.setCellValue(1000.5);
+            c0.setCellStyle(decimalStyle);
+            XSSFCell c1 = row.createCell(1);
+            c1.setCellValue(1200);
+            c1.setCellStyle(intStyle);
+            XSSFCell c2 = row.createCell(2);
+            c2.setCellValue(2000.034);
+            c2.setCellStyle(decimalStyle);
+
+            CellRangeAddress range = new CellRangeAddress(0, 0, 0, 2);
+            XDDFNumericalDataSource<Double> ds = XDDFDataSourcesFactory.fromNumericCellRange(sheet, range);
+
+            assertEquals("#,##0.###", ds.getFormatCode());
+            assertEquals("#,##0.###", ds.getPointFormatCode(0));
+            assertEquals("#,##0", ds.getPointFormatCode(1));
+            assertEquals("#,##0.###", ds.getPointFormatCode(2));
+
+            ds.setFormatCode("0.00");
+            assertEquals("0.00", ds.getFormatCode());
+            assertEquals("#,##0", ds.getPointFormatCode(1));
+
+            ds = XDDFDataSourcesFactory.fromNumericCellRange(sheet, range);
+            CTNumData cache = CTNumData.Factory.newInstance();
+            cache.setFormatCode("General");
+            ds.fillNumericalCache(cache);
+
+            assertEquals("#,##0.###", cache.getFormatCode());
+            assertEquals(3, cache.sizeOfPtArray());
+            assertFalse(cache.getPtArray(0).isSetFormatCode());
+            assertEquals("#,##0", cache.getPtArray(1).getFormatCode());
+            assertFalse(cache.getPtArray(2).isSetFormatCode());
+
+            ds.setFormatCode(null);
+            cache = CTNumData.Factory.newInstance();
+            cache.setFormatCode("General");
+            ds.fillNumericalCache(cache);
+            assertFalse(cache.isSetFormatCode());
+            assertEquals("#,##0.###", cache.getPtArray(0).getFormatCode());
+        }
+    }
+
+    private <T> void assertDataSourceIsEqualToArray(XDDFDataSource<T> ds, T[] array) {
+        assertEquals(ds.getPointCount(), array.length);
+        for (int i = 0; i < array.length; ++i) {
+            assertEquals(ds.getPointAt(i), array[i]);
+        }
+    }
+}

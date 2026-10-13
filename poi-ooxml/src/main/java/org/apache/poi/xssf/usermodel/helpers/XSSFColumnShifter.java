@@ -1,0 +1,75 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.xssf.usermodel.helpers;
+
+import org.apache.poi.ss.formula.FormulaShifter;
+import org.apache.poi.ss.usermodel.helpers.ColumnShifter;
+import org.apache.poi.util.Beta;
+import org.apache.poi.xssf.usermodel.XSSFSheet;
+
+/**
+ * Helper for shifting columns up or down
+ *
+ * @since 4.0.0
+ */
+// non-Javadoc: When possible, code should be implemented in the ColumnShifter abstract class to avoid duplication with
+// {@link org.apache.poi.hssf.usermodel.helpers.HSSFColumnShifter}
+@Beta
+public final class XSSFColumnShifter extends ColumnShifter {
+    private final XSSFSheet xssfSheet;
+
+    public XSSFColumnShifter(XSSFSheet sh) {
+        super(sh);
+        xssfSheet = sh;
+    }
+
+    @Override
+    public void updateNamedRanges(FormulaShifter formulaShifter) {
+        XSSFRowColShifter.updateNamedRanges(xssfSheet, formulaShifter);
+    }
+
+    @Override
+    public void updateFormulas(FormulaShifter formulaShifter) {
+        XSSFRowColShifter.updateFormulas(xssfSheet, formulaShifter);
+    }
+
+    @Override
+    public void updateConditionalFormatting(FormulaShifter formulaShifter) {
+        XSSFRowColShifter.updateConditionalFormatting(xssfSheet, formulaShifter);
+    }
+
+    @Override
+    public void updateHyperlinks(FormulaShifter formulaShifter) {
+        XSSFRowColShifter.updateHyperlinks(xssfSheet, formulaShifter);
+    }
+
+    /**
+     * Shift the anchors of the shapes (charts, pictures, ...) in the sheet's drawing along with the columns
+     * they are anchored to. A shape is moved when its top-left anchor column is within
+     * {@code [startColumn, endColumn]}; the whole shape is moved so it keeps its size.
+     * Shapes with an absolute anchor are not moved.
+     *
+     * @param startColumn the column to start shifting
+     * @param endColumn the column to end shifting
+     * @param n the number of columns to shift
+     * @since 6.0.0
+     */
+    public void shiftDrawingAnchors(int startColumn, int endColumn, int n) {
+        XSSFRowColShifter.shiftDrawingAnchorColumns(xssfSheet, startColumn, endColumn, n);
+    }
+}

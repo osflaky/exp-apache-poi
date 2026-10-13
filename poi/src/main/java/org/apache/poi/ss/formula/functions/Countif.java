@@ -1,0 +1,621 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.ss.formula.functions;
+
+import java.util.regex.Pattern;
+
+import org.apache.poi.ss.formula.ThreeDEval;
+import org.apache.poi.ss.formula.CacheAreaEval;
+import org.apache.poi.ss.formula.eval.AreaEval;
+import org.apache.poi.ss.formula.eval.BlankEval;
+import org.apache.poi.ss.formula.eval.BoolEval;
+import org.apache.poi.ss.formula.eval.ErrorEval;
+import org.apache.poi.ss.formula.eval.EvaluationException;
+import org.apache.poi.ss.formula.eval.NumberEval;
+import org.apache.poi.ss.formula.eval.OperandResolver;
+import org.apache.poi.ss.formula.eval.RefEval;
+import org.apache.poi.ss.formula.eval.StringEval;
+import org.apache.poi.ss.formula.eval.ValueEval;
+import org.apache.poi.ss.formula.functions.CountUtils.I_MatchPredicate;
+import org.apache.poi.ss.usermodel.FormulaError;
+import org.apache.poi.util.StringUtil;
+
+/**
+ * Implementation for the function COUNTIF
+ * <p>
+ *  Syntax: COUNTIF ( range, criteria )
+ *    <table>
+ *      <caption>Parameter descriptions</caption>
+ *      <tr><th>range&nbsp;&nbsp;&nbsp;</th><td>is the range of cells to be counted based on the criteria</td></tr>
+ *      <tr><th>criteria</th><td>is used to determine which cells to count</td></tr>
+ *    </table>
+ */
+public final class Countif extends Fixed2ArgFunction implements ArrayFunction {
+
+    private static final class CmpOp {
+        public static final int NONE = 0;
+        public static final int EQ = 1;
+        public static final int NE = 2;
+        public static final int LE = 3;
+        public static final int LT = 4;
+        public static final int GT = 5;
+        public static final int GE = 6;
+
+        public static final CmpOp OP_NONE = op("", NONE);
+        public static final CmpOp OP_EQ = op("=", EQ);
+        public static final CmpOp OP_NE = op("<>", NE);
+        public static final CmpOp OP_LE = op("<=", LE);
+        public static final CmpOp OP_LT = op("<", LT);
+        public static final CmpOp OP_GT = op(">", GT);
+        public static final CmpOp OP_GE = op(">=", GE);
+        private final String _representation;
+        private final int _code;
+
+        private static CmpOp op(String rep, int code) {
+            return new CmpOp(rep, code);
+        }
+        private CmpOp(String representation, int code) {
+            _representation = representation;
+            _code = code;
+        }
+        /**
+         * @return number of characters used to represent this operator
+         */
+        public int getLength() {
+            return _representation.length();
+        }
+        public int getCode() {
+            return _code;
+        }
+        public static CmpOp getOperator(String value) {
+            int len = value.length();
+            if (len < 1) {
+                return OP_NONE;
+            }
+
+            char firstChar = value.charAt(0);
+
+            return switch (firstChar) {
+                case '=' -> OP_EQ;
+                case '>' -> {
+                    if (len > 1) {
+                        switch (value.charAt(1)) {
+                            case '=':
+                                yield OP_GE;
+                        }
+                    }
+                    yield OP_GT;
+                }
+                case '<' -> {
+                    if (len > 1) {
+                        switch (value.charAt(1)) {
+                            case '=':
+                                yield OP_LE;
+                            case '>':
+                                yield OP_NE;
+                        }
+                    }
+                    yield OP_LT;
+                }
+                default -> OP_NONE;
+            };
+        }
+        public boolean evaluate(boolean cmpResult) {
+            return switch (_code) {
+                case NONE, EQ -> cmpResult;
+                case NE -> !cmpResult;
+                default -> throw new IllegalStateException("Cannot call boolean evaluate on non-equality operator '"
+                        + _representation + "'");
+            };
+        }
+        public boolean evaluate(int cmpResult) {
+            return switch (_code) {
+                case NONE, EQ -> cmpResult == 0;
+                case NE -> cmpResult != 0;
+                case LT -> cmpResult < 0;
+                case LE -> cmpResult <= 0;
+                case GT -> cmpResult > 0;
+                case GE -> cmpResult >= 0;
+                default -> throw new IllegalStateException("Cannot call boolean evaluate on non-equality operator '"
+                        + _representation + "'");
+            };
+        }
+        @Override
+        public String toString() {
+            return getClass().getName() + " [" + _representation + "]";
+        }
+        public String getRepresentation() {
+            return _representation;
+        }
+    }
+
+    private static abstract class MatcherBase implements I_MatchPredicate {
+        private final CmpOp _operator;
+
+        MatcherBase(CmpOp operator) {
+            _operator = operator;
+        }
+        protected final int getCode() {
+            return _operator.getCode();
+        }
+        protected final boolean evaluate(int cmpResult) {
+            return _operator.evaluate(cmpResult);
+        }
+        protected final boolean evaluate(boolean cmpResult) {
+            return _operator.evaluate(cmpResult);
+        }
+        @Override
+        public final String toString() {
+            return getClass().getName() + " [" + _operator.getRepresentation() + getValueText() + "]";
+        }
+        protected abstract String getValueText();
+    }
+
+    private static final class NumberMatcher extends MatcherBase {
+
+        private final double _value;
+
+        public NumberMatcher(double value, CmpOp operator) {
+            super(operator);
+            _value = value;
+        }
+        @Override
+        protected String getValueText() {
+            return String.valueOf(_value);
+        }
+
+        @Override
+        public boolean matches(ValueEval x) {
+            double testValue;
+            if(x instanceof StringEval se) {
+                // if the target(x) is a string, but parses as a number
+                // it may still count as a match, only for the equality operator
+                switch (getCode()) {
+                    case CmpOp.EQ:
+                    case CmpOp.NONE:
+                        break;
+                    case CmpOp.NE:
+                        // Always matches (inconsistent with above two cases).
+                        // for example '<>123' matches '123', '4', 'abc', etc
+                        return true;
+                    default:
+                        // never matches (also inconsistent with above three cases).
+                        // for example '>5' does not match '6',
+                        return false;
+                }
+                Double val = OperandResolver.parseDouble(se.getStringValue());
+                if(val == null) {
+                    // x is text that is not a number
+                    return false;
+                }
+                return _value == val;
+            } else if(x instanceof NumberEval ne) {
+                testValue = ne.getNumberValue();
+            } else if(x instanceof BlankEval) {
+                return getCode() == CmpOp.NE; // Excel counts blank values in range as not equal to any value. See Bugzilla 51498
+            } else {
+                // a boolean or error is not equal to any number
+                return getCode() == CmpOp.NE;
+            }
+            return evaluate(Double.compare(testValue, _value));
+        }
+    }
+    private static final class BooleanMatcher extends MatcherBase {
+
+        private final int _value;
+
+        public BooleanMatcher(boolean value, CmpOp operator) {
+            super(operator);
+            _value = boolToInt(value);
+        }
+        @Override
+        protected String getValueText() {
+            return _value == 1 ? "TRUE" : "FALSE";
+        }
+
+        private static int boolToInt(boolean value) {
+            return value ? 1 : 0;
+        }
+
+        @Override
+        public boolean matches(ValueEval x) {
+            int testValue;
+            if(x instanceof StringEval) {
+                // Note - Unlike with numbers, it seems that COUNTIF never matches
+                // boolean values when the target(x) is a string (so '<>TRUE' always does)
+                return getCode() == CmpOp.NE;
+                // uncomment to observe more intuitive behaviour
+                // StringEval se = (StringEval)x;
+                // Boolean val = parseBoolean(se.getStringValue());
+                // if(val == null) {
+                //     // x is text that is not a boolean
+                //     return false;
+                // }
+                // testValue = boolToInt(val.booleanValue());
+            } else if(x instanceof BoolEval be) {
+                testValue = boolToInt(be.getBooleanValue());
+            } else if(x instanceof BlankEval) {
+                return getCode() == CmpOp.NE; // Excel counts blank values in range as not equal to any value. See Bugzilla 51498
+            } else {
+                // a number or error is not equal to any boolean
+                return getCode() == CmpOp.NE;
+            }
+            return evaluate(testValue - _value);
+        }
+    }
+    public static final class ErrorMatcher extends MatcherBase {
+
+        private final int _value;
+
+        public ErrorMatcher(int errorCode, CmpOp operator) {
+            super(operator);
+            _value = errorCode;
+        }
+        @Override
+        protected String getValueText() {
+            return FormulaError.forInt(_value).getString();
+        }
+
+        @Override
+        public boolean matches(ValueEval x) {
+            if(x instanceof ErrorEval errorEval) {
+                int testValue = errorEval.getErrorCode();
+                return evaluate(testValue - _value);
+            }
+            // a blank, number, text or boolean is not equal to any error
+            return getCode() == CmpOp.NE;
+        }
+
+        public int getValue() {
+            return _value;
+        }
+    }
+    public static final class StringMatcher extends MatcherBase {
+
+        private final String _value;
+        private final Pattern _pattern;
+
+        public StringMatcher(String value, CmpOp operator) {
+            super(operator);
+            _value = value;
+            _pattern = switch (operator.getCode()) {
+                case CmpOp.NONE, CmpOp.EQ, CmpOp.NE -> getWildCardPattern(value);
+                // pattern matching is never used for < > <= =>
+                default -> null;
+            };
+        }
+        @Override
+        protected String getValueText() {
+            if (_pattern == null) {
+                return _value;
+            }
+            return _pattern.pattern();
+        }
+
+        @Override
+        public boolean matches(ValueEval x) {
+            if (x instanceof BlankEval) {
+                return switch (getCode()) {
+                    case CmpOp.NONE, CmpOp.EQ -> _value.isEmpty();
+                    case CmpOp.NE ->
+                        // pred '<>' matches empty string but not blank cell
+                        // pred '<>ABC'  matches blank and 'not ABC'
+                            !_value.isEmpty();
+                    default ->
+                        // no other criteria matches a blank cell
+                            false;
+                };
+            }
+            if(!(x instanceof StringEval stringEval)) {
+                // must always be string
+                // even if match str is wild, but contains only digits
+                // e.g. '4*7', NumberEval(4567) does not match
+                // - but a number, boolean or error is not equal to any text, so '<>' and '<>abc'
+                // do count it (bug 69853: COUNTIF(range,"<>") counts every non-blank cell)
+                return getCode() == CmpOp.NE;
+            }
+            String testedValue = stringEval.getStringValue();
+            if (testedValue.isEmpty() && _value.isEmpty()) {
+                // odd case: criteria '=' behaves differently to criteria ''
+
+                return switch (getCode()) {
+                    case CmpOp.NONE -> true;
+                    case CmpOp.EQ -> false;
+                    case CmpOp.NE -> true;
+                    default -> false;
+                };
+            }
+            if (_pattern != null) {
+                return evaluate(_pattern.matcher(testedValue).matches());
+            }
+            // String criteria in COUNTIF are case insensitive:
+            // for example, the string "apples" and the string "APPLES" will match the same cells.
+            return evaluate(testedValue.compareToIgnoreCase(_value));
+        }
+        /** the characters that have a special meaning in a regular expression (besides {@code ?} and {@code *}) */
+        private static final String REGEX_META_CHARS = "\\^$.|+()[]{}";
+
+        /**
+         * Translates Excel countif wildcard strings into java regex strings
+         * @return {@code null} if the specified value contains no special wildcard characters.
+         */
+        public static Pattern getWildCardPattern(String value) {
+            int len = value.length();
+            StringBuilder sb = new StringBuilder(len);
+            boolean hasWildCard = false;
+            for(int i=0; i<len; i++) {
+                char ch = value.charAt(i);
+                switch(ch) {
+                    case '?':  //Any single character
+                        hasWildCard = true;
+                        // match exactly one character
+                        sb.append('.');
+                        continue;
+                    case '*': //Zero or more characters
+                        hasWildCard = true;
+                        // match one or more occurrences of any character
+                        sb.append(".*");
+                        continue;
+                    case '~':
+                        if (i+1<len) {
+                            ch = value.charAt(i+1);
+                            switch (ch) {
+                                case '?':
+                                case '*':
+                                case '~':
+                                    // '~' escapes the wildcards and itself
+                                    hasWildCard = true;
+                                    sb.append('[').append(ch).append(']');
+                                    i++; // Note - incrementing loop variable here
+                                    continue;
+                            }
+                        }
+                        // else not '~?', '~*' or '~~'
+                        sb.append('~'); // just plain '~'
+                        continue;
+                }
+                if (REGEX_META_CHARS.indexOf(ch) >= 0) {
+                    // escape literal characters that would have special meaning in regex (bug 69878)
+                    sb.append('\\');
+                }
+                sb.append(ch);
+            }
+            if (hasWildCard) {
+                return Pattern.compile(sb.toString(), Pattern.CASE_INSENSITIVE);
+            }
+            return null;
+        }
+    }
+
+    @Override
+    public ValueEval evaluate(int srcRowIndex, int srcColumnIndex, ValueEval arg0, ValueEval arg1) {
+        if (isArrayCriteria(arg1, false)) {
+            return evaluateForEachCriterion((AreaEval) arg1,
+                    criterion -> evaluate(srcRowIndex, srcColumnIndex, arg0, criterion));
+        }
+        I_MatchPredicate mp = createCriteriaPredicate(arg1, srcRowIndex, srcColumnIndex);
+        if(mp == null) {
+            // If the criteria arg is a reference to a blank cell, countif always returns zero.
+            return NumberEval.ZERO;
+        }
+        try {
+            return new NumberEval(countMatchingCellsInArea(arg0, mp));
+        } catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+    }
+
+    /**
+     * Evaluated in array context (the result feeds an array-mode function such as SUMPRODUCT, or
+     * the cell is part of an array formula): a multi-cell range as criteria means one count per
+     * criterion.
+     * @since 6.0.0
+     */
+    @Override
+    public ValueEval evaluateArray(ValueEval[] args, int srcRowIndex, int srcColumnIndex) {
+        if (args.length != 2) {
+            return ErrorEval.VALUE_INVALID;
+        }
+        if (isArrayCriteria(args[1], true)) {
+            return evaluateForEachCriterion((AreaEval) args[1],
+                    criterion -> evaluate(srcRowIndex, srcColumnIndex, args[0], criterion));
+        }
+        return evaluate(srcRowIndex, srcColumnIndex, args[0], args[1]);
+    }
+
+    /**
+     * Decides whether a criteria argument stands for several criteria, so that the function is
+     * evaluated once per element and returns an array of the results (what
+     * {@code SUMPRODUCT(SUMIF(range,criteria_range,sum_range))} and
+     * {@code SUM(COUNTIF(range,{"a","b"}))} rely on), the way Excel does it:
+     * <ul>
+     * <li>an array constant or a computed array ({@code {"a","b"}}, {@code IF(...)}) always is;</li>
+     * <li>a multi-cell range is only in array context - inside an array-mode function such as
+     * SUMPRODUCT, or in an array formula. In an ordinary cell a range criteria is reduced to the
+     * cell on the formula's own row or column (implicit intersection), as Excel does there.</li>
+     * </ul>
+     *
+     * @param arrayContext whether the function is being evaluated in array context
+     * @since 6.0.0
+     */
+    /* package */ static boolean isArrayCriteria(ValueEval criteria, boolean arrayContext) {
+        if (!(criteria instanceof AreaEval ae) || ae.getHeight() * ae.getWidth() <= 1) {
+            return false;
+        }
+        return arrayContext || criteria instanceof CacheAreaEval;
+    }
+
+    /**
+     * The evaluation of a conditional aggregate for one criterion, used to evaluate it for each
+     * element of an array of criteria.
+     * @since 6.0.0
+     */
+    /* package */ interface CriterionEvaluation {
+        ValueEval evaluate(ValueEval criterion);
+    }
+
+    /**
+     * Evaluates a conditional aggregate once per element of an array of criteria and returns the
+     * results as an array of the same shape (and, for a range, the same position, so that a plain
+     * formula cell picks the element on its own row the way Excel's implicit intersection does).
+     * This is what makes {@code SUMPRODUCT(SUMIF(range,criteria_range,sum_range))},
+     * {@code SUM(COUNTIF(range,{"a","b"}))} and the like work.
+     * @since 6.0.0
+     */
+    /* package */ static ValueEval evaluateForEachCriterion(AreaEval criteria, CriterionEvaluation evaluation) {
+        int height = criteria.getHeight();
+        int width = criteria.getWidth();
+        ValueEval[] results = new ValueEval[height * width];
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                results[r * width + c] = evaluation.evaluate(criteria.getRelativeValue(r, c));
+            }
+        }
+        return new CacheAreaEval(criteria.getFirstRow(), criteria.getFirstColumn(),
+                criteria.getLastRow(), criteria.getLastColumn(), results);
+    }
+    /**
+     * @return the number of evaluated cells in the range that match the specified criteria
+     */
+    private double countMatchingCellsInArea(ValueEval rangeArg, I_MatchPredicate criteriaPredicate) throws EvaluationException {
+
+        if (rangeArg instanceof RefEval refEval) {
+            return CountUtils.countMatchingCellsInRef(refEval, criteriaPredicate);
+        } else if (rangeArg instanceof ThreeDEval threeDEval) {
+            return CountUtils.countMatchingCellsInArea(threeDEval, criteriaPredicate);
+        } else {
+            // the range argument must be a reference or an array
+            throw new EvaluationException(ErrorEval.VALUE_INVALID);
+        }
+    }
+
+    /**
+     * Creates a criteria predicate object for the supplied criteria arg
+     * @return {@code null} if the arg evaluates to blank.
+     */
+    /* package */ static I_MatchPredicate createCriteriaPredicate(ValueEval arg, int srcRowIndex, int srcColumnIndex) {
+
+        ValueEval evaluatedCriteriaArg = evaluateCriteriaArg(arg, srcRowIndex, srcColumnIndex);
+
+        if(evaluatedCriteriaArg instanceof NumberEval numberEval) {
+            return new NumberMatcher(numberEval.getNumberValue(), CmpOp.OP_NONE);
+        }
+        if(evaluatedCriteriaArg instanceof BoolEval boolEval) {
+            return new BooleanMatcher(boolEval.getBooleanValue(), CmpOp.OP_NONE);
+        }
+
+        if(evaluatedCriteriaArg instanceof StringEval stringEval) {
+            return createGeneralMatchPredicate(stringEval);
+        }
+        if(evaluatedCriteriaArg instanceof ErrorEval errorEval) {
+            return new ErrorMatcher(errorEval.getErrorCode(), CmpOp.OP_NONE);
+        }
+        if(evaluatedCriteriaArg == BlankEval.instance) {
+            return null;
+        }
+        throw new IllegalStateException("Unexpected type for criteria ("
+                + evaluatedCriteriaArg.getClass().getName() + ")");
+    }
+
+    /**
+     *
+     * @return the de-referenced criteria arg (possibly {@link ErrorEval})
+     */
+    private static ValueEval evaluateCriteriaArg(ValueEval arg, int srcRowIndex, int srcColumnIndex) {
+        try {
+            return OperandResolver.getSingleValue(arg, srcRowIndex, srcColumnIndex);
+        } catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+    }
+    /**
+     * When the second argument is a string, many things are possible
+     */
+    private static I_MatchPredicate createGeneralMatchPredicate(StringEval stringEval) {
+        String value = stringEval.getStringValue();
+        CmpOp operator = CmpOp.getOperator(value);
+        value = value.substring(operator.getLength());
+
+        Boolean booleanVal = parseBoolean(value);
+        if(booleanVal != null) {
+            return new BooleanMatcher(booleanVal, operator);
+        }
+
+        Double doubleVal = OperandResolver.parseDouble(value);
+        if(doubleVal != null) {
+            return new NumberMatcher(doubleVal, operator);
+        }
+        ErrorEval ee = parseError(value);
+        if (ee != null) {
+            return new ErrorMatcher(ee.getErrorCode(), operator);
+        }
+
+        //else - just a plain string with no interpretation.
+        return new StringMatcher(value, operator);
+    }
+    private static ErrorEval parseError(String value) {
+        if (value.length() < 4 || value.charAt(0) != '#') {
+            return null;
+        }
+        if (value.equals("#NULL!")) {
+            return ErrorEval.NULL_INTERSECTION;
+        }
+        if (value.equals("#DIV/0!")) {
+            return ErrorEval.DIV_ZERO;
+        }
+        if (value.equals("#VALUE!")) {
+            return ErrorEval.VALUE_INVALID;
+        }
+        if (value.equals("#REF!")) {
+            return ErrorEval.REF_INVALID;
+        }
+        if (value.equals("#NAME?")) {
+            return ErrorEval.NAME_INVALID;
+        }
+        if (value.equals("#NUM!")) {
+            return ErrorEval.NUM_ERROR;
+        }
+        if (value.equals("#N/A")) {
+            return ErrorEval.NA;
+        }
+
+        return null;
+    }
+    /**
+     * Boolean literals ('TRUE', 'FALSE') treated similarly but NOT same as numbers.
+     * @return {@code null} to represent blank values
+     */
+    /* package */ static Boolean parseBoolean(String strRep) {
+        if (strRep.isEmpty()) {
+            return null;
+        }
+        switch(strRep.charAt(0)) {
+            case 't', 'T' -> {
+                if(StringUtil.equalsIgnoreCase("TRUE", strRep)) {
+                    return Boolean.TRUE;
+                }
+            }
+            case 'f', 'F' -> {
+                if(StringUtil.equalsIgnoreCase("FALSE", strRep)) {
+                    return Boolean.FALSE;
+                }
+            }
+        }
+        return null;
+    }
+}

@@ -1,0 +1,77 @@
+/* ====================================================================
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
+   this work for additional information regarding copyright ownership.
+   The ASF licenses this file to You under the Apache License, Version 2.0
+   (the "License"); you may not use this file except in compliance with
+   the License.  You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+==================================================================== */
+
+package org.apache.poi.ss.formula.atp;
+
+import org.apache.poi.ss.formula.OperationEvaluationContext;
+import org.apache.poi.ss.formula.eval.*;
+import org.apache.poi.ss.formula.functions.FreeRefFunction;
+import org.apache.poi.ss.formula.functions.NumericFunction;
+import org.apache.poi.ss.util.ExcelArithmetic;
+
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+
+/**
+ * Implementation of Excel 'Analysis ToolPak' function MROUND()<br>
+ *
+ * Returns a number rounded to the desired multiple.<p>
+ *
+ * <b>Syntax</b><br>
+ * <b>MROUND</b>(<b>number</b>, <b>multiple</b>)
+ */
+final class MRound implements FreeRefFunction {
+
+    public static final FreeRefFunction instance = new MRound();
+
+    private MRound() {
+        // enforce singleton
+    }
+
+    public ValueEval evaluate(ValueEval[] args, OperationEvaluationContext ec) {
+        double number, multiple, result;
+
+        if (args.length != 2) {
+            return ErrorEval.VALUE_INVALID;
+        }
+
+        try {
+            number = OperandResolver.coerceValueToDouble(OperandResolver.getSingleValue(args[0], ec.getRowIndex(), ec.getColumnIndex()));
+            multiple = OperandResolver.coerceValueToDouble(OperandResolver.getSingleValue(args[1], ec.getRowIndex(), ec.getColumnIndex()));
+
+            if( multiple == 0.0 ) {
+                result = 0.0;
+            } else {
+                if(number*multiple < 0) {
+                    // Returns #NUM! because the number and the multiple have different signs
+                    throw new EvaluationException(ErrorEval.NUM_ERROR);
+                }
+                // like FLOOR and CEILING, round on Excel's 15-digit view of the number:
+                // MROUND(0.7+0.1,1.6) is 1.6, although 0.7999999999999999/1.6 is just under 0.5
+                // (and of the multiple: MROUND(0.45, 0.1*3) is 0.6, not 0.3)
+                BigDecimal bdMultiple = ExcelArithmetic.toBigDecimal(multiple);
+                result = bdMultiple.multiply(ExcelArithmetic.toBigDecimal(number).divide(bdMultiple, 0, RoundingMode.HALF_UP))
+                        .doubleValue();
+
+            }
+            NumericFunction.checkValue(result);
+            return new NumberEval(result);
+        } catch (EvaluationException e) {
+            return e.getErrorEval();
+        }
+    }
+}
